@@ -2,7 +2,7 @@
   "device_name": "Endgame Gear Endgame Gear OP1 8k v2 Gaming Mouse",
   "device_path": "/dev/input/event0",
   "kernel_release": "6.6.123.2-microsoft-standard-WSL2+",
-  "preempt_status": "none voluntary (full)",
+  "preempt_status": "full (CONFIG_PREEMPT=y)",
   "duration_requested_s": 10.0,
   "report_count": 39322,
   "syn_dropped_events": 0,

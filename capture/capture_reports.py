@@ -38,12 +38,29 @@ def list_devices():
 
 
 def read_preempt_status():
-    """Best-effort read of the kernel preemption model, for metadata."""
+    """Read kernel preemption model from compiled config."""
     try:
-        with open("/sys/kernel/debug/sched/preempt") as f:
+        import subprocess
+        result = subprocess.run(
+            ['zcat', '/proc/config.gz'],
+            capture_output=True, text=True
+        )
+        for line in result.stdout.splitlines():
+            if line == 'CONFIG_PREEMPT=y':
+                return 'full (CONFIG_PREEMPT=y)'
+            if line == 'CONFIG_PREEMPT_VOLUNTARY=y':
+                return 'voluntary (CONFIG_PREEMPT_VOLUNTARY=y)'
+            if line == 'CONFIG_PREEMPT_NONE=y':
+                return 'none (CONFIG_PREEMPT_NONE=y)'
+            if 'CONFIG_PREEMPT' in line and 'not set' not in line and line.startswith('CONFIG_PREEMPT='):
+                return line.strip()
+    except Exception:
+        pass
+    try:
+        with open('/sys/kernel/debug/sched/preempt') as f:
             return f.read().strip()
     except Exception:
-        return "unknown"
+        return 'unknown - check /proc/config.gz'
 
 
 def capture(device_path, duration_s, out_path):
