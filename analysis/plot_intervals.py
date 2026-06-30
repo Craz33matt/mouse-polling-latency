@@ -9,7 +9,8 @@ Figures produced:
   figures/interval_distributions.png  — KDE + histogram per rate, preempt vs stock pooled
   figures/tail_percentiles.png        — p95/p99/p99.9 grouped bar chart (pooled)
   figures/per_run_consistency.png     — boxplots showing within-condition variance across runs
-  figures/interval_timeseries.png     — 2kHz 2000-report window, preempt vs stock (run 1)
+  figures/interval_timeseries.png     — 2kHz full-capture small multiples (5 runs × 2 kernels)
+                                         plus rolling std dev (all 5 runs)
   figures/stats_table.png             — full stats table rendered as figure
 
 Stats also printed to stdout.
@@ -28,6 +29,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
@@ -45,7 +47,6 @@ FIG_DIR.mkdir(exist_ok=True)
 # ---------------------------------------------------------------------------
 DIST_RATES     = [1000, 2000, 4000]   # Hz — rates included in distribution/tail/consistency plots
 OUTLIER_FACTOR = 3.0                  # intervals > factor × expected are dropped as SYN_DROPPED gaps
-N_TIMESERIES   = 2000                 # number of consecutive reports to show in timeseries figure
 
 # Nominal expected intervals (µs) by configured polling rate.
 EXPECTED_US: dict[int, float] = {1000: 1000.0, 2000: 500.0, 4000: 250.0, 8000: 125.0}
@@ -348,48 +349,102 @@ def plot_per_run_consistency() -> None:
 
 # ---------------------------------------------------------------------------
 # Figure 4 — interval_timeseries.png
-# 2kHz preempt vs stock: 2000-report window centred at the midpoint of run 1.
-# Shows the raw shape of scheduling variation, not just summary statistics.
+# Top: small multiples of the full capture for all 5 runs × 2 kernels at 2kHz,
+#      downsampled 10x, so a reader can confirm the result isn't cherry-picked
+#      from one window of one run.
+# Bottom: rolling std dev (window=500) for all 5 runs, showing whether jitter
+#      is stationary across the capture or clustered in bursts.
 # ---------------------------------------------------------------------------
 def plot_timeseries() -> None:
     apply_dark_style()
-    fig, ax = plt.subplots(figsize=FIG_SIZE, dpi=DPI)
 
-    title_range: tuple[int, int] | None = None
+    fig = plt.figure(figsize=(19.2, 22), dpi=DPI)
+    outer = gridspec.GridSpec(2, 1, height_ratios=[7, 8], hspace=0.25, figure=fig)
 
-    for kernel, color in [("preempt", KERNEL_COLOR["preempt"]),
-                           ("stock",   KERNEL_COLOR["stock"])]:
-        paths = run_map.get((2000, kernel), [])
-        if not paths:
-            continue
-        ts      = pd.read_csv(paths[0]).sort_values("timestamp_s")["timestamp_s"].to_numpy()
-        iv      = np.diff(ts) * 1_000_000   # µs
-        mid     = len(iv) // 2
-        start   = mid - N_TIMESERIES // 2
-        end     = start + N_TIMESERIES
-        iv_plot = iv[start:end]
-        report_nums = np.arange(start + 1, end + 1)
+    # --- Top: 5 runs × 2 kernels small multiples ---
+    top_gs = gridspec.GridSpecFromSubplotSpec(5, 2, subplot_spec=outer[0],
+                                              hspace=0.55, wspace=0.15)
 
-        if title_range is None:
-            title_range = (int(report_nums[0]), int(report_nums[-1]))
+    DOWNSAMPLE = 10
+    kernels_order = ["preempt", "stock"]
 
-        label = f"2 kHz {'Preempt' if kernel == 'preempt' else 'Stock'}"
-        ax.plot(report_nums, iv_plot, color=color, linewidth=0.75, alpha=0.88, label=label)
+    # Shared y-limits across all small multiples, robust to extreme outliers.
+    all_vals = [run_ivs[::DOWNSAMPLE]
+                for kernel in kernels_order
+                for run_ivs in per_run[2000].get(kernel, [])]
+    if all_vals:
+        concat_all = np.concatenate(all_vals)
+        y_lo, y_hi = np.percentile(concat_all, [0.5, 99.5])
+        pad = (y_hi - y_lo) * 0.1
+        y_lo, y_hi = y_lo - pad, y_hi + pad
+    else:
+        y_lo, y_hi = 0.0, 1000.0
 
-    r0, r1 = title_range or (0, N_TIMESERIES)
-    fig.suptitle(
-        f"Interval Time-Series: 2 kHz Preempt vs Stock  (Run 1, Reports {r0:,}–{r1:,})",
-        fontsize=TITLE_FS, fontweight="bold",
-    )
+    for col, kernel in enumerate(kernels_order):
+        runs = per_run[2000].get(kernel, [])
+        for row in range(5):
+            ax = fig.add_subplot(top_gs[row, col])
+            if row < len(runs):
+                iv = runs[row][::DOWNSAMPLE]
+                x  = np.arange(1, len(iv) + 1) * DOWNSAMPLE
+                ax.plot(x, iv, color=KERNEL_COLOR[kernel], linewidth=0.5, alpha=0.85)
+                ax.axhline(500.0, color="#777777", linewidth=1.0, linestyle="--")
+                ax.set_ylim(y_lo, y_hi)
+                ax.set_title(f"{'Preempt' if kernel == 'preempt' else 'Stock'} run {row + 1}",
+                             fontsize=LABEL_FS - 2, fontweight="bold")
+            ax.tick_params(labelsize=TICK_FS - 3)
+            if row == 4:
+                ax.set_xlabel("Report #", fontsize=LABEL_FS - 3)
+            if col == 0:
+                ax.set_ylabel("µs", fontsize=LABEL_FS - 3)
+            ax.grid(alpha=0.15)
 
-    ax.axhline(500.0, color="#777777", linewidth=1.5, linestyle="--", label="Ideal 500 µs")
-    ax.set_xlabel("Report Number", fontsize=LABEL_FS)
-    ax.set_ylabel("Interval (µs)", fontsize=LABEL_FS)
-    ax.tick_params(labelsize=TICK_FS)
-    ax.legend(fontsize=LEGEND_FS)
-    ax.grid(alpha=0.18)
+    fig.text(0.5, 0.965, "2 kHz — All Runs, Full Capture (every 10th report shown)",
+             ha="center", fontsize=TITLE_FS, fontweight="bold")
 
-    fig.tight_layout()
+    # --- Bottom: rolling std dev, one subplot per run, preempt vs stock overlaid ---
+    ROLL_WINDOW = 500
+    bottom_gs = gridspec.GridSpecFromSubplotSpec(5, 1, subplot_spec=outer[1], hspace=0.55)
+
+    preempt_runs = per_run[2000].get("preempt", [])
+    stock_runs   = per_run[2000].get("stock", [])
+
+    # Shared y-limits across all 5 rolling-std subplots for easy comparison.
+    roll_all = [pd.Series(iv).rolling(ROLL_WINDOW).std().dropna().to_numpy()
+                for iv in preempt_runs + stock_runs]
+    if roll_all:
+        roll_hi = np.percentile(np.concatenate(roll_all), 99.5) * 1.1
+    else:
+        roll_hi = 1.0
+
+    for row in range(5):
+        ax_roll = fig.add_subplot(bottom_gs[row, 0])
+        for kernel, runs, color in [("preempt", preempt_runs, KERNEL_COLOR["preempt"]),
+                                    ("stock",   stock_runs,   KERNEL_COLOR["stock"])]:
+            if row >= len(runs):
+                continue
+            iv = runs[row]
+            roll_std = pd.Series(iv).rolling(ROLL_WINDOW).std().to_numpy()
+            x = np.arange(1, len(iv) + 1)
+            label = "Preempt" if kernel == "preempt" else "Stock"
+            ax_roll.plot(x, roll_std, color=color, linewidth=0.8, alpha=0.9, label=label)
+
+        ax_roll.axhline(0.0, color="#777777", linewidth=1.0, linestyle="--")
+        ax_roll.set_ylim(0, roll_hi)
+        ax_roll.set_title(f"Run {row + 1}", fontsize=LABEL_FS, fontweight="bold")
+        ax_roll.set_ylabel("Std (µs)", fontsize=LABEL_FS - 2)
+        ax_roll.tick_params(labelsize=TICK_FS - 1)
+        if row == 4:
+            ax_roll.set_xlabel("Report Number", fontsize=LABEL_FS)
+        if row == 0:
+            ax_roll.legend(fontsize=LEGEND_FS, loc="upper right")
+        ax_roll.grid(alpha=0.18)
+
+    bottom_pos = outer[1].get_position(fig)
+    fig.text(0.5, bottom_pos.y1 + 0.012,
+             f"Rolling Std Dev (window={ROLL_WINDOW} reports) — 2 kHz, Preempt vs Stock per Run",
+             ha="center", fontsize=TITLE_FS, fontweight="bold")
+
     out = FIG_DIR / "interval_timeseries.png"
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
