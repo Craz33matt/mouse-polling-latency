@@ -4,7 +4,7 @@
   "kernel_release": "6.18.33.1-microsoft-standard-WSL2",
   "preempt_status": "none (CONFIG_PREEMPT_NONE=y)",
   "duration_requested_s": 30.0,
-  "report_count": 119713,
+  "report_count": 119551,
   "syn_dropped_events": 0,
-  "capture_unix_time": 1782846353.2553504
+  "capture_unix_time": 1782852746.3583555
 }
