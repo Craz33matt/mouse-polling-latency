@@ -281,7 +281,8 @@ def plot_tail_percentiles() -> None:
 
 # ---------------------------------------------------------------------------
 # Figure 3 — interval_timeseries.png
-# 2kHz preempt vs stock: interval (µs) vs report number, first 2000 reports.
+# 2kHz preempt vs stock: a 2000-report window centred at the midpoint of each
+# capture, avoiding the startup transient in the first ~50 reports.
 # Horizontal reference line at ideal 500 µs.
 # ---------------------------------------------------------------------------
 N_TIMESERIES = 2000
@@ -289,8 +290,6 @@ N_TIMESERIES = 2000
 
 def load_raw_intervals(key: str) -> np.ndarray:
     """Load all intervals (including outliers) for timeseries display."""
-    path = DATA_DIR / data[key]["file"] if "file" in data[key] else None
-    # Reconstruct filename from key
     fname = f"{key}.csv"
     ts = pd.read_csv(DATA_DIR / fname).sort_values("timestamp_s")["timestamp_s"].to_numpy()
     return np.diff(ts) * 1_000_000
@@ -305,20 +304,34 @@ for ds in DATASETS:
 def plot_timeseries() -> None:
     apply_dark_style()
     fig, ax = plt.subplots(figsize=FIG_SIZE, dpi=DPI)
-    fig.suptitle(
-        "Interval Time-Series: 2 kHz Preempt vs Stock  (First 2000 Reports)",
-        fontsize=TITLE_FS, fontweight="bold",
-    )
+
+    title_range: tuple[int, int] | None = None
 
     for key, color in [("2khz_preempt", KERNEL_COLOR["preempt"]),
                        ("2khz_stock",   KERNEL_COLOR["stock"])]:
         if key not in data:
             continue
-        iv = load_raw_intervals(key)
-        iv_plot = iv[:N_TIMESERIES]
-        ax.plot(np.arange(1, len(iv_plot) + 1), iv_plot,
-                color=color, linewidth=0.75, alpha=0.88,
+        iv    = load_raw_intervals(key)
+        mid   = len(iv) // 2
+        start = mid - N_TIMESERIES // 2
+        end   = start + N_TIMESERIES
+        iv_plot = iv[start:end]
+
+        # 1-indexed report numbers so the axis reflects position in the full capture
+        report_nums = np.arange(start + 1, end + 1)
+
+        # Use the preempt series to set the title range (both are ~60 k, so near-identical)
+        if title_range is None:
+            title_range = (int(report_nums[0]), int(report_nums[-1]))
+
+        ax.plot(report_nums, iv_plot, color=color, linewidth=0.75, alpha=0.88,
                 label=data[key]["label"])
+
+    r0, r1 = title_range or (0, N_TIMESERIES)
+    fig.suptitle(
+        f"Interval Time-Series: 2 kHz Preempt vs Stock  (Reports {r0:,}–{r1:,})",
+        fontsize=TITLE_FS, fontweight="bold",
+    )
 
     ax.axhline(500.0, color="#777777", linewidth=1.5, linestyle="--",
                label="Ideal 500 µs")
