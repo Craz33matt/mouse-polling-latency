@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 """
-Mouse polling latency analysis.
+plot_intervals.py
 
-Loads CLOCK_MONOTONIC-stamped evdev timestamps, computes inter-report intervals,
-filters dropped/coalesced-report outliers, and produces four publication-quality
-figures in figures/.
+Reads all per-condition captures from data/raw/, aggregates across n=5 runs,
+and produces publication-quality figures for the README.
 
-Run from repo root:
+Figures produced:
+  figures/interval_distributions.png  — KDE + histogram per rate, preempt vs stock pooled
+  figures/tail_percentiles.png        — p95/p99/p99.9 grouped bar chart (pooled)
+  figures/per_run_consistency.png     — boxplots showing within-condition variance across runs
+  figures/interval_timeseries.png     — 2kHz 2000-report window, preempt vs stock (run 1)
+  figures/stats_table.png             — full stats table rendered as figure
+
+Stats also printed to stdout.
+
+Usage (from repo root, venv active):
     python analysis/plot_intervals.py
 """
 
+import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
@@ -25,46 +36,22 @@ from scipy.stats import gaussian_kde
 # Paths
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = REPO_ROOT / "data" / "raw"
-FIG_DIR = REPO_ROOT / "figures"
+DATA_DIR  = REPO_ROOT / "data" / "raw"
+FIG_DIR   = REPO_ROOT / "figures"
 FIG_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Dataset definitions
-# rate_hz is the configured polling rate; actual observed rate may differ.
+# Config
 # ---------------------------------------------------------------------------
-DATASETS = [
-    dict(key="1khz_preempt",  file="1khz_preempt.csv",  rate_hz=1000, kernel="preempt", label="1kHz Preempt"),
-    dict(key="1khz_stock",    file="1khz_stock.csv",    rate_hz=1000, kernel="stock",   label="1kHz Stock"),
-    dict(key="2khz_preempt",  file="2khz_preempt.csv",  rate_hz=2000, kernel="preempt", label="2kHz Preempt"),
-    dict(key="2khz_stock",    file="2khz_stock.csv",    rate_hz=2000, kernel="stock",   label="2kHz Stock"),
-    dict(key="4khz_preempt",  file="4khz_preempt.csv",  rate_hz=4000, kernel="preempt", label="4kHz Preempt"),
-    dict(key="4khz_stock",    file="4khz_stock.csv",    rate_hz=4000, kernel="stock",   label="4kHz Stock"),
-    # 8kHz: mouse configured at 8kHz but usbipd/vhci_hcd caps throughput at ~3,940 Hz.
-    # The observed interval is therefore ~250 µs, not 125 µs — use that as the outlier
-    # reference so double-report gaps (~500 µs) aren't falsely flagged.
-    # Included in stats table and timeseries only; excluded from distribution/tail plots.
-    dict(key="8khz_preempt",  file="8khz_preempt.csv",  rate_hz=8000, kernel="preempt", label="8kHz Preempt",
-         expected_us=250.0,
-         note="observed ~3,940 Hz (usbipd/vhci_hcd throughput cap; 250 µs reference used)"),
-]
+DIST_RATES     = [1000, 2000, 4000]   # Hz — rates included in distribution/tail/consistency plots
+OUTLIER_FACTOR = 3.0                  # intervals > factor × expected are dropped as SYN_DROPPED gaps
+N_TIMESERIES   = 2000                 # number of consecutive reports to show in timeseries figure
 
-# Nominal expected intervals by configured rate (µs).
-# Datasets may override via expected_us when the observed rate differs from the nominal rate.
+# Nominal expected intervals (µs) by configured polling rate.
 EXPECTED_US: dict[int, float] = {1000: 1000.0, 2000: 500.0, 4000: 250.0, 8000: 125.0}
-OUTLIER_FACTOR = 3.0
 
-# Rates included in distribution/tail-percentile plots (preempt + stock pairs at each rate).
-DIST_RATES = [1000, 2000, 4000]
-
-# ---------------------------------------------------------------------------
-# Colors
-# ---------------------------------------------------------------------------
 KERNEL_COLOR = {"preempt": "#29B6F6", "stock": "#FFA726"}
 
-# ---------------------------------------------------------------------------
-# Style constants
-# ---------------------------------------------------------------------------
 TITLE_FS  = 16
 LABEL_FS  = 13
 TICK_FS   = 11
@@ -78,21 +65,42 @@ def apply_dark_style() -> None:
 
 
 # ---------------------------------------------------------------------------
+# File discovery
+# ---------------------------------------------------------------------------
+def discover_runs() -> dict[tuple[int, str], list[Path]]:
+    """
+    Return {(rate_hz, kernel): [sorted list of CSV paths]} for all conditions.
+    Naming convention: {N}khz_{kernel}.csv (run 1), {N}khz_{kernel}2.csv (run 2), …
+    """
+    pattern = re.compile(r"^(\d+)khz_(preempt|stock)(\d*)$")
+    runs: dict[tuple[int, str], list[Path]] = defaultdict(list)
+    for p in sorted(DATA_DIR.glob("*.csv")):
+        m = pattern.match(p.stem)
+        if not m:
+            continue
+        rate_hz = int(m.group(1)) * 1000
+        kernel  = m.group(2)
+        runs[(rate_hz, kernel)].append(p)
+    return dict(runs)
+
+
+# ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 def load_intervals(csv_path: Path, expected_us: float) -> tuple[np.ndarray, np.ndarray, int]:
-    """Return (clean_intervals_µs, outlier_intervals_µs, total_interval_count)."""
-    df = pd.read_csv(csv_path)
-    df = df.sort_values("timestamp_s").reset_index(drop=True)
-    intervals = df["timestamp_s"].diff().dropna() * 1_000_000  # s → µs
+    """Return (clean_µs, outlier_µs, total_interval_count)."""
+    df = pd.read_csv(csv_path).sort_values("timestamp_s").reset_index(drop=True)
+    intervals = df["timestamp_s"].diff().dropna() * 1_000_000   # s → µs
     threshold = expected_us * OUTLIER_FACTOR
-    mask_ok = intervals <= threshold
+    mask_ok   = intervals <= threshold
     return intervals[mask_ok].to_numpy(), intervals[~mask_ok].to_numpy(), len(intervals)
 
 
-def compute_stats(clean: np.ndarray, outliers: np.ndarray, n_intervals: int, label: str) -> dict:
+def compute_stats(clean: np.ndarray, outliers: np.ndarray,
+                  n_intervals: int, label: str, n_runs: int) -> dict:
     return dict(
         label=label,
+        n_runs=n_runs,
         n_reports=n_intervals + 1,
         n_outliers=len(outliers),
         mean=float(np.mean(clean)),
@@ -108,78 +116,90 @@ def compute_stats(clean: np.ndarray, outliers: np.ndarray, n_intervals: int, lab
 # ---------------------------------------------------------------------------
 # Build in-memory dataset
 # ---------------------------------------------------------------------------
-data: dict[str, dict] = {}
+run_map = discover_runs()
+
+# per_run[rate_hz][kernel] = list of clean interval arrays (one per run)
+per_run: dict[int, dict[str, list[np.ndarray]]] = defaultdict(lambda: defaultdict(list))
+
+# pooled[rate_hz][kernel] = clean intervals concatenated across all runs
+pooled: dict[int, dict[str, np.ndarray]] = defaultdict(dict)
+
 stats_rows: list[dict] = []
 
-for ds in DATASETS:
-    path = DATA_DIR / ds["file"]
-    if not path.exists():
-        print(f"WARNING: {path} not found — skipping.", file=sys.stderr)
-        continue
-    # Use per-dataset override when the observed rate differs from the nominal rate_hz.
-    expected = ds.get("expected_us", EXPECTED_US[ds["rate_hz"]])
-    clean, outliers, n_iv = load_intervals(path, expected)
-    data[ds["key"]] = dict(
-        clean=clean, outliers=outliers, n_intervals=n_iv,
-        rate_hz=ds["rate_hz"], kernel=ds["kernel"], label=ds["label"],
-        expected_us=expected,
-        note=ds.get("note", ""),
-    )
-    stats_rows.append(compute_stats(clean, outliers, n_iv, ds["label"]))
+for (rate_hz, kernel), paths in sorted(run_map.items()):
+    # 8kHz usbipd/vhci_hcd throughput cap means observed rate is ~3,940 Hz;
+    # use 250µs as reference so double-report gaps aren't falsely flagged.
+    expected = 250.0 if rate_hz == 8000 else EXPECTED_US.get(rate_hz, 1000.0)
+
+    all_clean:    list[np.ndarray] = []
+    all_outliers: list[np.ndarray] = []
+    total_iv = 0
+
+    for p in paths:
+        clean, outliers, n_iv = load_intervals(p, expected)
+        per_run[rate_hz][kernel].append(clean)
+        all_clean.append(clean)
+        all_outliers.append(outliers)
+        total_iv += n_iv
+
+    pooled_clean    = np.concatenate(all_clean)    if all_clean    else np.array([])
+    pooled_outliers = np.concatenate(all_outliers) if all_outliers else np.array([])
+    pooled[rate_hz][kernel] = pooled_clean
+
+    label = f"{rate_hz // 1000} kHz {'Preempt' if kernel == 'preempt' else 'Stock'}"
+    stats_rows.append(compute_stats(pooled_clean, pooled_outliers, total_iv, label, len(paths)))
 
 stats_df = pd.DataFrame(stats_rows)
+
+print("Discovered conditions:")
+for (rate_hz, kernel), paths in sorted(run_map.items()):
+    print(f"  {rate_hz // 1000} kHz {kernel}: {len(paths)} run(s)")
 
 
 # ---------------------------------------------------------------------------
 # Figure 1 — interval_distributions.png
-# KDE + histogram, preempt vs stock, for DIST_RATES side by side.
-# X-axis zoomed to ±30% of the expected interval so tail detail is visible.
+# Pooled KDE + histogram per rate, preempt vs stock overlaid.
+# X-axis zoomed to ±30% of expected interval so distribution detail is visible.
 # ---------------------------------------------------------------------------
 def plot_distributions() -> None:
     apply_dark_style()
-    rate_titles = {
-        1000: "1 kHz  (expected 1000 µs)",
-        2000: "2 kHz  (expected 500 µs)",
-        4000: "4 kHz  (expected 250 µs)",
-    }
     fig, axes = plt.subplots(1, len(DIST_RATES), figsize=FIG_SIZE, dpi=DPI)
     fig.suptitle(
-        "Inter-Report Interval Distributions: Preempt vs Stock Kernel",
+        "Inter-Report Interval Distributions: Preempt vs Stock  (n=5 runs pooled)",
         fontsize=TITLE_FS, fontweight="bold", y=0.995,
     )
 
     for ax, rate in zip(axes, DIST_RATES):
-        # Use the preempt entry's expected_us as the panel reference (both kernels share it).
-        ref_key  = f"{rate // 1000}khz_preempt"
-        expected = data[ref_key]["expected_us"] if ref_key in data else EXPECTED_US[rate]
+        expected = EXPECTED_US[rate]
         zoom_lo  = expected * 0.70
         zoom_hi  = expected * 1.30
 
         for kernel in ("preempt", "stock"):
-            key = f"{rate // 1000}khz_{kernel}"
-            if key not in data:
+            if kernel not in pooled.get(rate, {}):
                 continue
-            vals  = data[key]["clean"]
-            color = KERNEL_COLOR[kernel]
-            label = data[key]["label"]
+            vals   = pooled[rate][kernel]
+            color  = KERNEL_COLOR[kernel]
+            n_runs = len(per_run[rate][kernel])
+            label  = f"{'Preempt' if kernel == 'preempt' else 'Stock'}  (n={n_runs})"
 
-            # Histogram over zoom window (density)
             vals_zoom = vals[(vals >= zoom_lo) & (vals <= zoom_hi)]
-            ax.hist(vals_zoom, bins=120, density=True, alpha=0.25,
-                    color=color, linewidth=0)
+            ax.hist(vals_zoom, bins=120, density=True, alpha=0.25, color=color, linewidth=0)
 
-            # KDE fitted on full clean distribution, evaluated over zoom window
             if len(vals_zoom) > 10:
-                kde  = gaussian_kde(vals, bw_method="silverman")
-                xk   = np.linspace(zoom_lo, zoom_hi, 800)
+                kde = gaussian_kde(vals, bw_method="silverman")
+                xk  = np.linspace(zoom_lo, zoom_hi, 800)
                 ax.plot(xk, kde(xk), color=color, linewidth=2.2, label=label)
 
-        ax.axvline(expected, color="#777777", linewidth=1.2, linestyle="--",
+            p99 = np.percentile(vals, 99)
+            ax.axvline(p99, color=color, linestyle="--", linewidth=1.0, alpha=0.7)
+
+        ax.axvline(expected, color="#777777", linewidth=1.2, linestyle=":",
                    label=f"Ideal {int(expected)} µs")
         ax.set_xlim(zoom_lo, zoom_hi)
         ax.set_xlabel("Interval (µs)", fontsize=LABEL_FS)
         ax.set_ylabel("Density", fontsize=LABEL_FS)
-        ax.set_title(rate_titles[rate], fontsize=LABEL_FS + 1, fontweight="bold")
+        ax.set_title(f"{rate // 1000} kHz  (expected {int(expected)} µs)",
+                     fontsize=LABEL_FS + 1, fontweight="bold")
         ax.tick_params(labelsize=TICK_FS)
         ax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.0f"))
         ax.legend(fontsize=LEGEND_FS)
@@ -194,21 +214,18 @@ def plot_distributions() -> None:
 
 # ---------------------------------------------------------------------------
 # Figure 2 — tail_percentiles.png
-# Grouped bar chart: p95 / p99 / p99.9 for each condition in DIST_RATES.
+# Grouped bar chart: p95 / p99 / p99.9 for each condition (pooled across runs).
+# Heights are raw µs values; dashed reference lines show the ideal interval.
 # ---------------------------------------------------------------------------
 def plot_tail_percentiles() -> None:
     apply_dark_style()
 
-    conditions = []
-    for rate in DIST_RATES:
-        for kernel in ("preempt", "stock"):
-            key = f"{rate // 1000}khz_{kernel}"
-            if key in data:
-                conditions.append(key)
+    conditions = [(r, k) for r in DIST_RATES for k in ("preempt", "stock")
+                  if k in pooled.get(r, {})]
 
-    pct_keys    = ["p95", "p99", "p999"]
-    pct_labels  = ["p95", "p99", "p99.9"]
-    pct_colors  = ["#26C6DA", "#0097A7", "#006064"]
+    pct_keys   = ["p95", "p99", "p999"]
+    pct_labels = ["p95", "p99", "p99.9"]
+    pct_colors = ["#26C6DA", "#0097A7", "#006064"]
 
     n_cond    = len(conditions)
     n_pct     = len(pct_keys)
@@ -217,14 +234,15 @@ def plot_tail_percentiles() -> None:
 
     fig, ax = plt.subplots(figsize=FIG_SIZE, dpi=DPI)
     fig.suptitle(
-        "Tail Latency Percentiles (p95 / p99 / p99.9) by Condition",
+        "Tail Latency Percentiles (p95 / p99 / p99.9) by Condition  (n=5 runs pooled)",
         fontsize=TITLE_FS, fontweight="bold",
     )
 
     for pi, (pk, pl, pc) in enumerate(zip(pct_keys, pct_labels, pct_colors)):
         vals = []
-        for key in conditions:
-            row = stats_df[stats_df["label"] == data[key]["label"]]
+        for rate, kernel in conditions:
+            label = f"{rate // 1000} kHz {'Preempt' if kernel == 'preempt' else 'Stock'}"
+            row   = stats_df[stats_df["label"] == label]
             vals.append(float(row[pk].iloc[0]) if not row.empty else 0.0)
 
         offset = (pi - n_pct / 2 + 0.5) * bar_width
@@ -241,29 +259,18 @@ def plot_tail_percentiles() -> None:
                     fontsize=8, color="white", rotation=90,
                 )
 
-    # Reference lines at expected interval per rate group.
-    # Group by (rate_hz, expected_us) so an override like 8kHz→250µs doesn't collide.
-    group_spans: dict[tuple[int, float], list[int]] = {}
-    for i, key in enumerate(conditions):
-        gk = (data[key]["rate_hz"], data[key]["expected_us"])
-        group_spans.setdefault(gk, []).append(i)
-
-    drawn_labels: set[str] = set()
-    for (rate, exp), idxs in group_spans.items():
-        lo    = x[min(idxs)] - 0.45
-        hi    = x[max(idxs)] + 0.45
-        lbl   = f"Ideal {int(exp)} µs"
-        label = lbl if lbl not in drawn_labels else "_nolegend_"
-        drawn_labels.add(lbl)
+    drawn: set[str] = set()
+    for rate, _ in conditions:
+        exp = EXPECTED_US[rate]
+        lbl = f"Ideal {int(exp)} µs"
+        idxs = [j for j, (r, _) in enumerate(conditions) if r == rate]
+        lo, hi = x[min(idxs)] - 0.45, x[max(idxs)] + 0.45
         ax.hlines(exp, lo, hi, colors="#666666", linestyles="--",
-                  linewidth=1.2, label=label, zorder=2)
+                  linewidth=1.2, label=lbl if lbl not in drawn else "_nolegend_", zorder=2)
+        drawn.add(lbl)
 
-    x_labels = []
-    for key in conditions:
-        rate = data[key]["rate_hz"]
-        kernel = data[key]["kernel"].capitalize()
-        x_labels.append(f"{rate // 1000} kHz\n{kernel}")
-
+    x_labels = [f"{r // 1000} kHz\n{'Preempt' if k == 'preempt' else 'Stock'}"
+                for r, k in conditions]
     ax.set_xticks(x)
     ax.set_xticklabels(x_labels, fontsize=TICK_FS)
     ax.set_xlabel("Condition", fontsize=LABEL_FS)
@@ -280,61 +287,102 @@ def plot_tail_percentiles() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Figure 3 — interval_timeseries.png
-# 2kHz preempt vs stock: a 2000-report window centred at the midpoint of each
-# capture, avoiding the startup transient in the first ~50 reports.
-# Horizontal reference line at ideal 500 µs.
+# Figure 3 — per_run_consistency.png  (new with n=5)
+# Boxplots of each individual run per condition.
+# Tight clustering across all 5 runs validates that results are reproducible,
+# not artifacts of a single lucky or unlucky capture.
 # ---------------------------------------------------------------------------
-N_TIMESERIES = 2000
+def plot_per_run_consistency() -> None:
+    apply_dark_style()
+
+    n_rates = len(DIST_RATES)
+    fig, axes = plt.subplots(1, n_rates, figsize=FIG_SIZE, dpi=DPI)
+    fig.suptitle(
+        "Within-Condition Variance Across Runs (n=5)  — IQR Boxplots, Outliers Hidden",
+        fontsize=TITLE_FS, fontweight="bold", y=0.995,
+    )
+
+    for ax, rate in zip(axes, DIST_RATES):
+        plot_data:   list[np.ndarray] = []
+        plot_labels: list[str]        = []
+        plot_colors: list[str]        = []
+
+        for kernel in ("preempt", "stock"):
+            for i, run_ivs in enumerate(per_run[rate].get(kernel, []), start=1):
+                plot_data.append(run_ivs)
+                plot_labels.append(f"{'Pre' if kernel == 'preempt' else 'Stk'} r{i}")
+                plot_colors.append(KERNEL_COLOR[kernel])
+
+        if not plot_data:
+            continue
+
+        bp = ax.boxplot(
+            plot_data, tick_labels=plot_labels,
+            patch_artist=True, showfliers=False,
+            medianprops=dict(color="white", linewidth=2),
+            whiskerprops=dict(linewidth=1.2),
+            capprops=dict(linewidth=1.2),
+        )
+        for patch, color in zip(bp["boxes"], plot_colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.6)
+
+        ax.axhline(EXPECTED_US[rate], color="#777777", linewidth=1.2, linestyle="--",
+                   label=f"Ideal {int(EXPECTED_US[rate])} µs", zorder=2)
+
+        ax.set_title(f"{rate // 1000} kHz", fontsize=LABEL_FS + 1, fontweight="bold")
+        ax.set_ylabel("Interval (µs)", fontsize=LABEL_FS)
+        ax.tick_params(labelsize=TICK_FS - 1)
+        patches = [mpatches.Patch(color=KERNEL_COLOR[k], alpha=0.6,
+                                  label="Preempt" if k == "preempt" else "Stock")
+                   for k in ("preempt", "stock")]
+        ax.legend(handles=patches, fontsize=LEGEND_FS)
+        ax.grid(axis="y", alpha=0.15)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    out = FIG_DIR / "per_run_consistency.png"
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
 
 
-def load_raw_intervals(key: str) -> np.ndarray:
-    """Load all intervals (including outliers) for timeseries display."""
-    fname = f"{key}.csv"
-    ts = pd.read_csv(DATA_DIR / fname).sort_values("timestamp_s")["timestamp_s"].to_numpy()
-    return np.diff(ts) * 1_000_000
-
-
-# Store filenames in data dict for convenience
-for ds in DATASETS:
-    if ds["key"] in data:
-        data[ds["key"]]["file"] = ds["file"]
-
-
+# ---------------------------------------------------------------------------
+# Figure 4 — interval_timeseries.png
+# 2kHz preempt vs stock: 2000-report window centred at the midpoint of run 1.
+# Shows the raw shape of scheduling variation, not just summary statistics.
+# ---------------------------------------------------------------------------
 def plot_timeseries() -> None:
     apply_dark_style()
     fig, ax = plt.subplots(figsize=FIG_SIZE, dpi=DPI)
 
     title_range: tuple[int, int] | None = None
 
-    for key, color in [("2khz_preempt", KERNEL_COLOR["preempt"]),
-                       ("2khz_stock",   KERNEL_COLOR["stock"])]:
-        if key not in data:
+    for kernel, color in [("preempt", KERNEL_COLOR["preempt"]),
+                           ("stock",   KERNEL_COLOR["stock"])]:
+        paths = run_map.get((2000, kernel), [])
+        if not paths:
             continue
-        iv    = load_raw_intervals(key)
-        mid   = len(iv) // 2
-        start = mid - N_TIMESERIES // 2
-        end   = start + N_TIMESERIES
+        ts      = pd.read_csv(paths[0]).sort_values("timestamp_s")["timestamp_s"].to_numpy()
+        iv      = np.diff(ts) * 1_000_000   # µs
+        mid     = len(iv) // 2
+        start   = mid - N_TIMESERIES // 2
+        end     = start + N_TIMESERIES
         iv_plot = iv[start:end]
-
-        # 1-indexed report numbers so the axis reflects position in the full capture
         report_nums = np.arange(start + 1, end + 1)
 
-        # Use the preempt series to set the title range (both are ~60 k, so near-identical)
         if title_range is None:
             title_range = (int(report_nums[0]), int(report_nums[-1]))
 
-        ax.plot(report_nums, iv_plot, color=color, linewidth=0.75, alpha=0.88,
-                label=data[key]["label"])
+        label = f"2 kHz {'Preempt' if kernel == 'preempt' else 'Stock'}"
+        ax.plot(report_nums, iv_plot, color=color, linewidth=0.75, alpha=0.88, label=label)
 
     r0, r1 = title_range or (0, N_TIMESERIES)
     fig.suptitle(
-        f"Interval Time-Series: 2 kHz Preempt vs Stock  (Reports {r0:,}–{r1:,})",
+        f"Interval Time-Series: 2 kHz Preempt vs Stock  (Run 1, Reports {r0:,}–{r1:,})",
         fontsize=TITLE_FS, fontweight="bold",
     )
 
-    ax.axhline(500.0, color="#777777", linewidth=1.5, linestyle="--",
-               label="Ideal 500 µs")
+    ax.axhline(500.0, color="#777777", linewidth=1.5, linestyle="--", label="Ideal 500 µs")
     ax.set_xlabel("Report Number", fontsize=LABEL_FS)
     ax.set_ylabel("Interval (µs)", fontsize=LABEL_FS)
     ax.tick_params(labelsize=TICK_FS)
@@ -349,27 +397,23 @@ def plot_timeseries() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Figure 4 — stats_table.png
-# Full stats table rendered as a matplotlib figure.
+# Figure 5 — stats_table.png
+# Full pooled stats rendered as a matplotlib figure.
 # ---------------------------------------------------------------------------
 def plot_stats_table() -> None:
     apply_dark_style()
 
     col_headers = [
-        "Condition", "Reports", "Outliers",
+        "Condition", "Runs", "Reports", "Outliers",
         "Mean (µs)", "Median (µs)", "Std (µs)",
         "p95 (µs)", "p99 (µs)", "p99.9 (µs)", "Max (µs)",
     ]
 
-    note_keys = {ds["key"] for ds in DATASETS if ds.get("note")}
-
     table_rows: list[list[str]] = []
     for row in stats_df.itertuples(index=False):
-        # Find matching key
-        key  = next((ds["key"] for ds in DATASETS if ds["label"] == row.label), None)
-        flag = " *" if key in note_keys else ""
         table_rows.append([
-            row.label + flag,
+            row.label,
+            str(row.n_runs),
             f"{row.n_reports:,}",
             f"{row.n_outliers:,}",
             f"{row.mean:.2f}",
@@ -383,7 +427,7 @@ def plot_stats_table() -> None:
 
     fig, ax = plt.subplots(figsize=FIG_SIZE, dpi=DPI)
     fig.suptitle(
-        "Mouse Polling Latency — Full Statistics Summary",
+        "Mouse Polling Latency — Full Statistics Summary  (n=5 runs pooled per condition)",
         fontsize=TITLE_FS, fontweight="bold", y=0.97,
     )
     ax.axis("off")
@@ -395,33 +439,21 @@ def plot_stats_table() -> None:
         cellLoc="center",
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(11)
-    tbl.scale(1, 2.4)
+    tbl.set_fontsize(10)
+    tbl.scale(1, 2.2)
 
-    # Header row
     for j in range(len(col_headers)):
         cell = tbl[0, j]
         cell.set_facecolor("#1565C0")
         cell.set_text_props(color="white", fontweight="bold")
 
-    # Data rows — alternating shades, highlight 8kHz specially
-    for i, row in enumerate(table_rows, start=1):
-        is_8k   = "8kHz" in row[0]
-        base_fc = "#4A1942" if is_8k else ("#1A237E" if i % 2 == 0 else "#0D1B4B")
+    for i in range(len(table_rows)):
         for j in range(len(col_headers)):
-            cell = tbl[i, j]
-            cell.set_facecolor(base_fc)
+            cell = tbl[i + 1, j]
+            cell.set_facecolor("#1A237E" if i % 2 == 0 else "#0D1B4B")
             cell.set_text_props(color="white")
 
-    ax.text(
-        0.5, 0.03,
-        "* 8kHz Preempt: observed rate ~3,800 Hz due to usbipd/vhci_hcd throughput cap — "
-        "does not represent true 8 kHz behaviour",
-        ha="center", va="bottom", transform=ax.transAxes,
-        fontsize=10, color="#FFCC02", style="italic",
-    )
-
-    fig.tight_layout(rect=[0, 0.04, 1, 0.96])
+    fig.tight_layout(rect=[0, 0.02, 1, 0.95])
     out = FIG_DIR / "stats_table.png"
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
@@ -429,43 +461,34 @@ def plot_stats_table() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Terminal summary table
+# Terminal summary
 # ---------------------------------------------------------------------------
 def print_summary() -> None:
-    sep = "=" * 102
-    hdr = (
-        f"{'Condition':<20} {'Reports':>8} {'Outliers':>9} "
-        f"{'Mean µs':>9} {'Median':>9} {'Std':>8} "
-        f"{'p95':>8} {'p99':>8} {'p99.9':>9} {'Max':>10}"
-    )
-    print(f"\n{sep}")
-    print(hdr)
-    print(sep)
+    sep = "=" * 114
+    hdr = (f"{'Condition':<22} {'Runs':>4} {'Reports':>9} {'Outliers':>9} "
+           f"{'Mean µs':>9} {'Median':>9} {'Std':>8} "
+           f"{'p95':>8} {'p99':>8} {'p99.9':>9} {'Max':>10}")
+    print(f"\n{sep}\n{hdr}\n{sep}")
     for row in stats_df.itertuples(index=False):
-        key  = next((ds["key"] for ds in DATASETS if ds["label"] == row.label), "")
-        flag = " *" if key in {ds["key"] for ds in DATASETS if ds.get("note")} else ""
-        print(
-            f"{row.label + flag:<20} {row.n_reports:>8,} {row.n_outliers:>9,} "
-            f"{row.mean:>9.2f} {row.median:>9.2f} {row.std:>8.3f} "
-            f"{row.p95:>8.2f} {row.p99:>8.2f} {row.p999:>9.2f} {row.imax:>10.2f}"
-        )
-    print(sep)
-    print("* 8kHz Preempt: observed ~3,800 Hz (usbipd/vhci_hcd throughput cap)")
-    print()
+        print(f"{row.label:<22} {row.n_runs:>4} {row.n_reports:>9,} {row.n_outliers:>9,} "
+              f"{row.mean:>9.2f} {row.median:>9.2f} {row.std:>8.3f} "
+              f"{row.p95:>8.2f} {row.p99:>8.2f} {row.p999:>9.2f} {row.imax:>10.2f}")
+    print(sep + "\n")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    if not data:
+    if not run_map:
         print("No data files found — check DATA_DIR path.", file=sys.stderr)
         sys.exit(1)
 
-    print("Generating figures …")
+    print("Generating figures…")
     plot_distributions()
     plot_tail_percentiles()
+    plot_per_run_consistency()
     plot_timeseries()
     plot_stats_table()
     print_summary()
-    print("Done.")
+    print("Done. Figures written to figures/")
