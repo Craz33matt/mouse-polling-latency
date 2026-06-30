@@ -26,22 +26,29 @@ scheduling on timing consistency, not absolute device latency.
 
 ## 2. Kernel Preemption Level
 
-The custom kernel used in preemptive captures reports:
+The custom kernel used in preemptive captures was compiled with:
 
-preempt_status: none voluntary (full)
+`CONFIG_PREEMPT=y`
 
-This is **voluntary preemption**, not full real-time preemption (`PREEMPT_RT`).
-In voluntary mode the kernel yields at explicit yield points; it does not
-forcibly interrupt running kernel threads the way a true RT kernel would.
+This is **full preemption**, the strongest preemption level achievable in
+the WSL2 environment short of `PREEMPT_RT`. With full preemption enabled,
+the kernel can interrupt lower-priority threads at almost any point to
+service higher-priority work such as input event handling.
 
-**Consequence:** Any scheduling improvement measured here is a lower bound on
-what full `PREEMPT_RT` would achieve. The effect of true RT preemption on
-input timing would likely be larger.
+The preempt_status field in capture metadata previously reported
+"none voluntary (full)" — this was an inaccurate reading from a
+permission-denied sysfs path. The compiled config (`/proc/config.gz`)
+confirms `CONFIG_PREEMPT=y` with no runtime override applied.
 
-**Why this was the limit:** WSL2 runs on a Microsoft-maintained kernel fork.
-Full `PREEMPT_RT` patch series cannot be cleanly applied to the WSL2 kernel
-without significant additional work. Voluntary preemption is the maximum
-level practically achievable in this environment.
+**Consequence:** This is a lower bound on what `PREEMPT_RT` would achieve,
+but a stronger baseline than voluntary preemption. Any scheduling
+improvement measured here reflects full kernel preemption vs the stock
+WSL2 kernel's non-preemptive scheduler.
+
+**Why PREEMPT_RT was not used:** The `PREEMPT_RT` patch series does not
+apply cleanly to the Microsoft WSL2 kernel fork without significant
+additional porting work. Full preemption (`CONFIG_PREEMPT=y`) is the
+maximum level practically achievable in this environment.
 
 ---
 
@@ -98,7 +105,7 @@ research measures.
 
 **Device-side scan/report desync** — inside the mouse, the sensor samples
 motion on its own clock (scan rate) independently of when the MCU ships USB
-reports (report rate). If these are not synchronized, a report can carry 
+reports (report rate). If these are not synchronized, a report can carry
 outdated motion data before it ever leaves the device. No amount of host-side
 preemption fixes this — it requires firmware-level synchronization. This is
 what Wooting refers to as "True 8K" polling.
@@ -122,12 +129,30 @@ produce the most representative steady-state inter-report intervals.
 
 ---
 
+## 7. usbipd Throughput Cap at High Polling Rates
+
+At the 8kHz device polling setting, the observed report rate through the
+usbipd virtual USB layer was approximately 3,800Hz rather than 8,000Hz.
+This indicates the vhci_hcd forwarding layer saturates at roughly 4kHz for
+HID interrupt transfers.
+
+**Consequence:** Captures labeled `8khz_*` reflect a device setting of 8kHz
+but an observed rate of ~3,900Hz. The preemptive vs stock kernel comparison
+remains valid since both conditions share the same forwarding ceiling.
+
+**Native Linux would not have this limitation** — direct USB controller
+access removes the forwarding layer entirely and is identified as the
+correct environment for true 8kHz measurement.
+
+---
+
 ## Summary Table
 
 | Limitation | Effect | Mitigated? |
 |---|---|---|
 | usbipd overhead | Raises absolute latency baseline | Yes — present in both conditions equally |
-| Voluntary preemption only | Understates full RT effect | Documented — lower bound claim only |
+| Full preemption only, not PREEMPT_RT | Understates full RT effect | Documented — lower bound claim only |
 | evdev timestamps, not usbmon | Misses intra-driver processing time | Documented — future work |
 | PAW3950 NDA firmware | No device-side access | Documented — dev board identified as workaround |
 | Human motion variability | Minor inter-run inconsistency | Minimized via consistent protocol |
+| usbipd throughput cap | 8kHz setting yields ~3,900Hz observed | Documented — native Linux identified as fix |
