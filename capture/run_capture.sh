@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Usage: capture/run_capture.sh <idle|cpu|mem|combined> <output.csv>
 set -euo pipefail
+trap 'pkill -x stress-ng 2>/dev/null || true' EXIT
+cd "$(dirname "$0")/.."
+
+if [ $# -ne 2 ]; then
+  echo "Usage: capture/run_capture.sh <idle|cpu|mem|combined> <output.csv>"
+  exit 1
+fi
 MODE=$1
 OUT=$2
 
