@@ -1,0 +1,13 @@
+{
+  "device_name": "Endgame Gear Endgame Gear OP1 8k v2 Gaming Mouse",
+  "device_path": "/dev/input/event0",
+  "kernel_release": "6.6.123.2-microsoft-standard-WSL2+",
+  "preempt_compiled": "CONFIG_PREEMPT=y",
+  "preempt_active": "full",
+  "preempt_status": "full",
+  "kernel_cmdline": "initrd=\\initrd.img WSL_ROOT_INIT=1 panic=-1 nr_cpus=16 hv_utils.timesync_implicit=1 console=hvc0 debug pty.legacy_count=0 WSL_ENABLE_CRASH_DUMP=1",
+  "duration_requested_s": 30.0,
+  "report_count": 59998,
+  "syn_dropped_events": 0,
+  "capture_unix_time": 1792299169.7893713
+}
