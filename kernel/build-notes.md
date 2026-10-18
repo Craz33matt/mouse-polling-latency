@@ -3,9 +3,11 @@
 ## Kernel Details
 - **Version:** 6.6.123.2-microsoft-standard-WSL2+
 - **Branch:** linux-msft-wsl-6.6.y
-- **Preemption model:** Full preemption — CONFIG_PREEMPT=y
+- **Preemption model:** Full preemption, CONFIG_PREEMPT=y
 - **Timer frequency:** CONFIG_HZ=250
-- **Dynamic preemption:** CONFIG_PREEMPT_DYNAMIC=y (no runtime override applied)
+- **Dynamic preemption:** CONFIG_PREEMPT_DYNAMIC=y. The earlier experiment and the
+  full-mode captures used the compiled default (full). The none-mode captures
+  booted the same binary with preempt=none (see docs/kernel-build.md).
 - **Full config:** see kernel/config.txt
 
 ## Key Config Flags
@@ -40,9 +42,10 @@ to interrupt lower-priority kernel threads faster and more consistently
 than the stock WSL2 kernel's non-preemptive scheduler.
 
 ## Notes
-- CONFIG_PREEMPT_RT (full real-time preemption) was not attempted —
-  the PREEMPT_RT patch series does not apply cleanly to the Microsoft
+- CONFIG_PREEMPT_RT (full real-time preemption) was not attempted.
+  The PREEMPT_RT patch series does not apply cleanly to the Microsoft
   WSL2 kernel fork without significant additional porting work
-- Runtime preemption mode was not overridden via boot parameter;
-  compiled default (full) was used for all preemptive captures
+- The earlier experiment's preempt captures and the full-mode captures used
+  the compiled default (full) with no preempt= boot parameter. The none-mode
+  captures booted the same binary with preempt=none (see docs/kernel-build.md)
 - perf_event_paranoid = 2 (standard WSL2 restriction)
