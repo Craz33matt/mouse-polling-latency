@@ -18,8 +18,10 @@ Usage:
 """
 
 import argparse
+import gzip
 import json
 import platform
+import re
 import time
 from pathlib import Path
 
@@ -37,30 +39,45 @@ def list_devices():
         print(f"  {d.path:20s}  {d.name}")
 
 
-def read_preempt_status():
-    """Read kernel preemption model from compiled config."""
+# Kconfig preemption-model choices. Other CONFIG_PREEMPT*=y lines (BUILD,
+# COUNT, DYNAMIC, RCU, ...) are not the model and are ignored.
+PREEMPT_MODEL_CONFIGS = (
+    'CONFIG_PREEMPT_NONE', 'CONFIG_PREEMPT_VOLUNTARY', 'CONFIG_PREEMPT',
+    'CONFIG_PREEMPT_LAZY', 'CONFIG_PREEMPT_RT',
+)
+
+
+def read_preempt_compiled():
+    """Compiled-in default preemption model from /proc/config.gz, e.g. 'CONFIG_PREEMPT=y'."""
     try:
-        import subprocess
-        result = subprocess.run(
-            ['zcat', '/proc/config.gz'],
-            capture_output=True, text=True
-        )
-        for line in result.stdout.splitlines():
-            if line == 'CONFIG_PREEMPT=y':
-                return 'full (CONFIG_PREEMPT=y)'
-            if line == 'CONFIG_PREEMPT_VOLUNTARY=y':
-                return 'voluntary (CONFIG_PREEMPT_VOLUNTARY=y)'
-            if line == 'CONFIG_PREEMPT_NONE=y':
-                return 'none (CONFIG_PREEMPT_NONE=y)'
-            if 'CONFIG_PREEMPT' in line and 'not set' not in line and line.startswith('CONFIG_PREEMPT='):
-                return line.strip()
+        with gzip.open('/proc/config.gz', 'rt') as f:
+            for line in f:
+                line = line.strip()
+                if line.endswith('=y') and line[:-2] in PREEMPT_MODEL_CONFIGS:
+                    return line
     except Exception:
         pass
+    return 'unknown'
+
+
+def read_preempt_active():
+    """Active preemption mode with CONFIG_PREEMPT_DYNAMIC (may differ from the
+    compiled default via preempt= on the kernel cmdline). debugfs needs root.
+    File looks like 'none voluntary (full)'; return the parenthesized word."""
     try:
         with open('/sys/kernel/debug/sched/preempt') as f:
+            m = re.search(r'\((\w+)\)', f.read())
+        return m.group(1) if m else 'unknown'
+    except Exception:
+        return 'unknown'
+
+
+def read_kernel_cmdline():
+    try:
+        with open('/proc/cmdline') as f:
             return f.read().strip()
     except Exception:
-        return 'unknown - check /proc/config.gz'
+        return 'unknown'
 
 
 def capture(device_path, duration_s, out_path):
@@ -98,11 +115,15 @@ def capture(device_path, duration_s, out_path):
         for t in timestamps:
             f.write(f"{t:.9f}\n")
 
+    preempt_active = read_preempt_active()
     meta = {
         "device_name": dev.name,
         "device_path": device_path,
         "kernel_release": platform.release(),
-        "preempt_status": read_preempt_status(),
+        "preempt_compiled": read_preempt_compiled(),
+        "preempt_active": preempt_active,
+        "preempt_status": preempt_active,   # legacy alias for older analysis code
+        "kernel_cmdline": read_kernel_cmdline(),
         "duration_requested_s": duration_s,
         "report_count": len(timestamps),
         "syn_dropped_events": drops,

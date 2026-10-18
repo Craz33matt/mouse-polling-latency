@@ -19,6 +19,7 @@ Usage (from repo root, venv active):
     python analysis/plot_intervals.py
 """
 
+import json
 import re
 import sys
 from collections import defaultdict
@@ -52,6 +53,13 @@ OUTLIER_FACTOR = 3.0                  # intervals > factor × expected are dropp
 EXPECTED_US: dict[int, float] = {1000: 1000.0, 2000: 500.0, 4000: 250.0, 8000: 125.0}
 
 KERNEL_COLOR = {"preempt": "#29B6F6", "stock": "#FFA726"}
+
+# stress-ng parameters for the 2kHz stress captures (identical on both kernels).
+STRESS_PARAMS: dict[str, str] = {
+    "cpu":      "stress-ng --cpu 4",
+    "mem":      "stress-ng --vm 2 --vm-bytes 50%",
+    "combined": "stress-ng --cpu 4 --vm 1 --vm-bytes 50% --io 1",
+}
 
 TITLE_FS  = 16
 LABEL_FS  = 13
@@ -516,6 +524,210 @@ def plot_stats_table() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Figure 6 — stress_comparison.png
+# Std dev and p99 at 2kHz under background stress, preempt vs stock.
+# Idle is the 5 per-run values (median bar, min–max error bar, individual dots);
+# stress conditions are single captures. Shaded bands show each kernel's idle
+# run-to-run range so a stress bar can be judged against normal variation.
+# Also writes figures/stress_stats.md.
+# ---------------------------------------------------------------------------
+def plot_stress_comparison() -> None:
+    expected = EXPECTED_US[2000]
+    kernels  = ("preempt", "stock")
+    required_preempt = {"preempt": "CONFIG_PREEMPT=y", "stock": "CONFIG_PREEMPT_NONE=y"}
+    required_active  = {"preempt": "full", "stock": "none"}
+
+    # --- Validate stress captures before using them ---
+    problems: list[str] = []
+    for kernel in kernels:
+        for cond in STRESS_PARAMS:
+            csv_path  = DATA_DIR / f"2khz_{kernel}_stress_{cond}.csv"
+            meta_path = csv_path.with_suffix(".meta.json")
+            if not csv_path.exists() or not meta_path.exists():
+                problems.append(f"{csv_path.name}: CSV or .meta.json sidecar missing")
+                continue
+            meta = json.loads(meta_path.read_text())
+            dropped = meta.get("syn_dropped_events")
+            if dropped != 0:
+                problems.append(f"{meta_path.name}: syn_dropped_events = {dropped} (expected 0)")
+            # Newer captures record the active dynamic-preemption mode; older
+            # ones only have the compiled config in preempt_status.
+            if "preempt_active" in meta:
+                field, want = "preempt_active", required_active[kernel]
+                ok = meta["preempt_active"] == want
+            else:
+                field, want = "preempt_status", required_preempt[kernel]
+                ok = want in meta.get("preempt_status", "")
+            if not ok:
+                problems.append(f"{meta_path.name}: {field} = {meta.get(field, '')!r} "
+                                f"(expected {want!r} for a {kernel} capture "
+                                f"— possibly mislabeled)")
+    if problems:
+        raise RuntimeError("Stress capture validation failed:\n  " + "\n  ".join(problems))
+
+    def metrics(clean: np.ndarray, outliers: np.ndarray, n_iv: int) -> dict:
+        return dict(
+            reports=n_iv + 1,
+            outliers=len(outliers),
+            std=float(np.std(clean)),
+            p99=float(np.percentile(clean, 99)),
+            p999=float(np.percentile(clean, 99.9)),
+            imax=float(np.max(clean)),
+        )
+
+    # --- Idle: per-run metrics (per_run holds clean intervals; counts need a reload) ---
+    idle_runs: dict[str, list[dict]] = {}
+    for kernel in kernels:
+        idle_runs[kernel] = []
+        for p, clean in zip(run_map.get((2000, kernel), []), per_run[2000][kernel]):
+            _, outliers, n_iv = load_intervals(p, expected)
+            idle_runs[kernel].append(metrics(clean, outliers, n_iv))
+
+    idle_range = {k: {m: (min(r[m] for r in idle_runs[k]), max(r[m] for r in idle_runs[k]))
+                      for m in ("std", "p99")}
+                  for k in kernels}
+
+    # --- Stress: single captures ---
+    stress: dict[str, dict[str, dict]] = {k: {} for k in kernels}
+    for kernel in kernels:
+        for cond in STRESS_PARAMS:
+            clean, outliers, n_iv = load_intervals(
+                DATA_DIR / f"2khz_{kernel}_stress_{cond}.csv", expected)
+            stress[kernel][cond] = metrics(clean, outliers, n_iv)
+
+    # --- Figure ---
+    apply_dark_style()
+    group_labels = ["Idle (n=5 runs)", "CPU (n=1)", "Memory (n=1)", "Combined (n=1)"]
+    conds        = list(STRESS_PARAMS)   # cpu, mem, combined
+    bar_width    = 0.35
+    x            = np.arange(len(group_labels))
+    label_bbox   = dict(boxstyle="round,pad=0.15", fc="black", alpha=0.6, ec="none")
+
+    fig, (ax_std, ax_p99) = plt.subplots(2, 1, figsize=FIG_SIZE, dpi=DPI)
+
+    def draw_panel(ax, metric: str) -> None:
+        y_top = 0.0
+        for ki, kernel in enumerate(kernels):
+            color  = KERNEL_COLOR[kernel]
+            name   = "Preempt" if kernel == "preempt" else "Stock"
+            offset = (ki - 0.5) * bar_width
+            lo, hi = idle_range[kernel][metric]
+
+            ax.axhspan(lo, hi, color=color, alpha=0.08, zorder=1,
+                       label=f"{name} idle range")
+
+            idle_vals = [r[metric] for r in idle_runs[kernel]]
+            idle_med  = float(np.median(idle_vals))
+            heights   = [idle_med] + [stress[kernel][c][metric] for c in conds]
+            bars = ax.bar(x + offset, heights, width=bar_width, color=color,
+                          label=name, zorder=3)
+
+            # Idle bar: min–max error bar plus the 5 individual run values.
+            xc = x[0] + offset
+            ax.errorbar(xc, idle_med, yerr=[[idle_med - lo], [hi - idle_med]],
+                        fmt="none", ecolor="white", elinewidth=1.4, capsize=6, zorder=4)
+            jitter = np.linspace(-0.07, 0.07, len(idle_vals))
+            ax.scatter(xc + jitter, idle_vals, s=18, color="white",
+                       edgecolors="black", linewidths=0.6, zorder=5)
+
+            for i, (bar, v) in enumerate(zip(bars, heights)):
+                y_lbl = hi if i == 0 else v   # idle label clears the error bar
+                ax.annotate(f"{v:.1f}", (bar.get_x() + bar.get_width() / 2, y_lbl),
+                            xytext=(0, 4), textcoords="offset points",
+                            ha="center", va="bottom", fontsize=TICK_FS,
+                            color="white", bbox=label_bbox, zorder=6)
+            y_top = max(y_top, hi, *heights)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(group_labels, fontsize=TICK_FS)
+        ax.tick_params(axis="y", labelsize=TICK_FS)
+        ax.grid(axis="y", alpha=0.20, zorder=0)
+        ax.set_ylim(0, y_top * 1.18)
+
+    draw_panel(ax_std, "std")
+    ax_std.set_ylabel("Std Dev of Inter-Report Interval (µs)", fontsize=LABEL_FS)
+    ax_std.set_title("Scheduling Jitter Under Background Stress, 2 kHz",
+                     fontsize=TITLE_FS, fontweight="bold")
+    ax_std.legend(fontsize=LEGEND_FS, loc="upper right", ncol=2)
+
+    draw_panel(ax_p99, "p99")
+    ax_p99.axhline(expected, color="#888888", linestyle="--", linewidth=1.2,
+                   label=f"Ideal {int(expected)} µs", zorder=2)
+    ax_p99.set_ylabel("p99 Interval (µs)", fontsize=LABEL_FS)
+    ax_p99.set_title("p99 Tail Latency Under Background Stress, 2 kHz",
+                     fontsize=TITLE_FS, fontweight="bold")
+    ax_p99.legend(fontsize=LEGEND_FS, loc="upper right", ncol=3)
+
+    fig.tight_layout(h_pad=2.5)
+    cond_names = {"cpu": "CPU", "mem": "Memory", "combined": "Combined"}
+    caption = "    ".join(f"{cond_names[c]}: {cmd}" for c, cmd in STRESS_PARAMS.items())
+    caption += ("\nStress conditions are single captures; "
+                "shaded bands show idle run-to-run range.")
+    fig.text(0.01, -0.005, caption, ha="left", va="top",
+             fontsize=TICK_FS, color="#BBBBBB", family="monospace")
+
+    out = FIG_DIR / "stress_comparison.png"
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print("Saved figures/stress_comparison.png")
+
+    # --- Stress stats table (stdout + markdown) ---
+    headers = ["Condition", "Kernel", "n", "Reports", "Outliers",
+               "Std", "p99", "p99.9", "Max", "Outside idle range?"]
+    rows: list[list[str]] = []
+    for kernel in kernels:
+        name = "Preempt" if kernel == "preempt" else "Stock"
+        runs = idle_runs[kernel]
+        med  = {m: float(np.median([r[m] for r in runs]))
+                for m in ("reports", "outliers", "std", "p99", "p999", "imax")}
+        rows.append(["Idle (median)", name, str(len(runs)),
+                     f"{med['reports']:,.0f}", f"{med['outliers']:,.0f}",
+                     f"{med['std']:.2f}", f"{med['p99']:.2f}",
+                     f"{med['p999']:.2f}", f"{med['imax']:.2f}", "—"])
+        lo, hi = idle_range[kernel]["std"]
+        for c in conds:
+            s = stress[kernel][c]
+            outside = "yes" if (s["std"] < lo or s["std"] > hi) else "no"
+            rows.append([cond_names[c], name, "1",
+                         f"{s['reports']:,}", f"{s['outliers']:,}",
+                         f"{s['std']:.2f}", f"{s['p99']:.2f}",
+                         f"{s['p999']:.2f}", f"{s['imax']:.2f}", outside])
+
+    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+    sep = "=" * (sum(widths) + 2 * (len(widths) - 1))
+    print(f"\nStress comparison, 2 kHz (\"Outside idle range?\" compares Std "
+          f"against that kernel's idle min–max)\n{sep}")
+    print("  ".join(h.ljust(w) if i < 2 else h.rjust(w)
+                    for i, (h, w) in enumerate(zip(headers, widths))))
+    print(sep)
+    for r in rows:
+        print("  ".join(v.ljust(w) if i < 2 else v.rjust(w)
+                        for i, (v, w) in enumerate(zip(r, widths))))
+    print(sep)
+    for kernel in kernels:
+        name = "Preempt" if kernel == "preempt" else "Stock"
+        (slo, shi), (plo, phi) = idle_range[kernel]["std"], idle_range[kernel]["p99"]
+        print(f"{name} idle range: std {slo:.2f}–{shi:.2f} µs, p99 {plo:.2f}–{phi:.2f} µs")
+    print()
+
+    md = ["# Stress Comparison, 2 kHz", "",
+          "Idle rows are medians of 5 per-run values; stress rows are single 30 s captures.",
+          "\"Outside idle range?\" compares Std against that kernel's idle min–max.", "",
+          "| " + " | ".join(headers) + " |",
+          "|" + "|".join(["---"] * 2 + ["---:"] * (len(headers) - 3) + [":---:"]) + "|"]
+    md += ["| " + " | ".join(r) + " |" for r in rows]
+    md += ["", "Idle run-to-run range (min–max of 5 runs):", ""]
+    for kernel in kernels:
+        name = "Preempt" if kernel == "preempt" else "Stock"
+        (slo, shi), (plo, phi) = idle_range[kernel]["std"], idle_range[kernel]["p99"]
+        md.append(f"- {name}: std {slo:.2f}–{shi:.2f} µs, p99 {plo:.2f}–{phi:.2f} µs")
+    md += ["", "Stress parameters:", ""]
+    md += [f"- {cond_names[c]}: `{cmd}`" for c, cmd in STRESS_PARAMS.items()]
+    (FIG_DIR / "stress_stats.md").write_text("\n".join(md) + "\n")
+    print("Saved figures/stress_stats.md")
+
+
+# ---------------------------------------------------------------------------
 # Terminal summary
 # ---------------------------------------------------------------------------
 def print_summary() -> None:
@@ -545,5 +757,6 @@ if __name__ == "__main__":
     plot_per_run_consistency()
     plot_timeseries()
     plot_stats_table()
+    plot_stress_comparison()
     print_summary()
     print("Done. Figures written to figures/")
