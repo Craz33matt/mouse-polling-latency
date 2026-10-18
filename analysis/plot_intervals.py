@@ -33,7 +33,7 @@ import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
 import numpy as np
 import pandas as pd
-from scipy.stats import gaussian_kde
+from scipy.stats import fisher_exact, gaussian_kde
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -728,6 +728,242 @@ def plot_stress_comparison() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Figure 7 — same_kernel_comparison.png
+# One kernel (6.6.123.2) booted in two dynamic preemption modes (full / none),
+# so preemption mode is the only variable. The unit of analysis is the run:
+# bars are medians of per-run values, dots are the runs, error bars min–max.
+# A 2 s warmup-trimmed recomputation is reported in the tables only.
+# Also writes figures/same_kernel_stats.md.
+# ---------------------------------------------------------------------------
+SAME_KERNEL_MODES = ("full", "none")
+SAME_KERNEL_RUNS  = {"idle": 5, "cpu": 3, "mem": 3, "combined": 3}
+WARMUP_INTERVALS  = 4000   # 2 s at 2 kHz
+REJECTED_DIR      = REPO_ROOT / "data" / "rejected"
+
+
+def plot_same_kernel_comparison() -> None:
+    expected   = EXPECTED_US[2000]
+    conds      = list(SAME_KERNEL_RUNS)
+    cond_names = {"idle": "Idle", "cpu": "CPU", "mem": "Memory", "combined": "Combined"}
+    mode_names = {"full": "Preempt full", "none": "Preempt none"}
+    mode_color = {"full": KERNEL_COLOR["preempt"], "none": KERNEL_COLOR["stock"]}
+
+    def run_path(mode: str, cond: str, i: int) -> Path:
+        return DATA_DIR / f"2khz_{mode}_{cond}{i}.csv"
+
+    # --- 1. Validation ---
+    problems: list[str] = []
+    releases: dict[str, list[str]] = defaultdict(list)
+    for mode in SAME_KERNEL_MODES:
+        for cond, n in SAME_KERNEL_RUNS.items():
+            for i in range(1, n + 1):
+                csv_path  = run_path(mode, cond, i)
+                meta_path = csv_path.with_suffix(".meta.json")
+                if not csv_path.exists() or not meta_path.exists():
+                    problems.append(f"{csv_path.name}: CSV or .meta.json sidecar missing")
+                    continue
+                meta = json.loads(meta_path.read_text())
+                if meta.get("syn_dropped_events") != 0:
+                    problems.append(f"{meta_path.name}: syn_dropped_events = "
+                                    f"{meta.get('syn_dropped_events')!r} (expected 0)")
+                if meta.get("preempt_active") != mode:
+                    problems.append(f"{meta_path.name}: preempt_active = "
+                                    f"{meta.get('preempt_active')!r} (filename says {mode!r})")
+                releases[meta.get("kernel_release", "<missing>")].append(csv_path.name)
+    if len(releases) > 1:
+        detail = "; ".join(f"{rel}: {len(files)} file(s), e.g. {files[0]}"
+                           for rel, files in releases.items())
+        problems.append(f"kernel_release differs across same-kernel files — {detail}")
+    if problems:
+        raise RuntimeError("Same-kernel capture validation failed:\n  " + "\n  ".join(problems))
+    kernel_release = next(iter(releases))
+
+    # --- 2. Per-run metrics (full capture and warmup-trimmed) ---
+    def run_metrics(clean: np.ndarray, outliers: np.ndarray) -> dict:
+        return dict(
+            std=float(np.std(clean)),
+            p99=float(np.percentile(clean, 99)),
+            p999=float(np.percentile(clean, 99.9)),
+            imax=float(np.max(clean)),
+            outliers=len(outliers),
+        )
+
+    def load_trimmed(csv_path: Path) -> tuple[np.ndarray, np.ndarray]:
+        # Same filtering as load_intervals(), applied after dropping the first
+        # WARMUP_INTERVALS raw intervals so the cut is identical for every file.
+        df = pd.read_csv(csv_path).sort_values("timestamp_s").reset_index(drop=True)
+        iv = (df["timestamp_s"].diff().dropna() * 1_000_000).to_numpy()[WARMUP_INTERVALS:]
+        ok = iv <= expected * OUTLIER_FACTOR
+        return iv[ok], iv[~ok]
+
+    runs:    dict[str, dict[str, list[dict]]] = {m: {} for m in SAME_KERNEL_MODES}
+    trimmed: dict[str, dict[str, list[dict]]] = {m: {} for m in SAME_KERNEL_MODES}
+    for mode in SAME_KERNEL_MODES:
+        for cond, n in SAME_KERNEL_RUNS.items():
+            runs[mode][cond], trimmed[mode][cond] = [], []
+            for i in range(1, n + 1):
+                p = run_path(mode, cond, i)
+                clean, outliers, _ = load_intervals(p, expected)
+                runs[mode][cond].append(run_metrics(clean, outliers))
+                trimmed[mode][cond].append(run_metrics(*load_trimmed(p)))
+
+    def vals(data, mode: str, cond: str, metric: str) -> list[float]:
+        return [r[metric] for r in data[mode][cond]]
+
+    # --- 3. Figure ---
+    apply_dark_style()
+    group_labels = [f"{cond_names[c]} (n={n})" for c, n in SAME_KERNEL_RUNS.items()]
+    bar_width    = 0.35
+    x            = np.arange(len(conds))
+    label_bbox   = dict(boxstyle="round,pad=0.15", fc="black", alpha=0.6, ec="none")
+
+    fig, (ax_std, ax_p99) = plt.subplots(2, 1, figsize=FIG_SIZE, dpi=DPI)
+    fig.suptitle(f"Same Kernel ({kernel_release.split('-')[0]}), "
+                 "Preemption Mode Only: 2 kHz",
+                 fontsize=TITLE_FS, fontweight="bold")
+
+    def draw_panel(ax, metric: str) -> None:
+        y_top = 0.0
+        for mi, mode in enumerate(SAME_KERNEL_MODES):
+            offset = (mi - 0.5) * bar_width
+            for ci, cond in enumerate(conds):
+                v   = vals(runs, mode, cond, metric)
+                med = float(np.median(v))
+                lo, hi = min(v), max(v)
+                xc  = x[ci] + offset
+                ax.bar(xc, med, width=bar_width, color=mode_color[mode],
+                       label=mode_names[mode] if ci == 0 else "_nolegend_", zorder=3)
+                ax.errorbar(xc, med, yerr=[[med - lo], [hi - med]], fmt="none",
+                            ecolor="white", elinewidth=1.4, capsize=6, zorder=4)
+                ax.scatter(xc + np.linspace(-0.07, 0.07, len(v)), v, s=18, color="white",
+                           edgecolors="black", linewidths=0.6, zorder=5)
+                ax.annotate(f"{med:.1f}", (xc, hi), xytext=(0, 4),
+                            textcoords="offset points", ha="center", va="bottom",
+                            fontsize=TICK_FS, color="white", bbox=label_bbox, zorder=6)
+                y_top = max(y_top, hi)
+        ax.set_xticks(x)
+        ax.set_xticklabels(group_labels, fontsize=TICK_FS)
+        ax.tick_params(axis="y", labelsize=TICK_FS)
+        ax.grid(axis="y", alpha=0.20, zorder=0)
+        ax.set_ylim(0, y_top * 1.18)
+
+    draw_panel(ax_std, "std")
+    ax_std.set_ylabel("Std Dev of Inter-Report Interval (µs)", fontsize=LABEL_FS)
+    ax_std.legend(fontsize=LEGEND_FS, loc="upper right")
+
+    draw_panel(ax_p99, "p99")
+    ax_p99.axhline(expected, color="#888888", linestyle="--", linewidth=1.2,
+                   label=f"Ideal {int(expected)} µs", zorder=2)
+    ax_p99.set_ylabel("p99 Interval (µs)", fontsize=LABEL_FS)
+    ax_p99.legend(fontsize=LEGEND_FS, loc="upper right", ncol=3)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97], h_pad=2.5)
+    caption = "    ".join(f"{cond_names[c]}: {cmd}" for c, cmd in STRESS_PARAMS.items())
+    caption += ("\nBars: median of runs. Dots: individual runs. "
+                "Error bars: min–max across runs.")
+    fig.text(0.01, -0.005, caption, ha="left", va="top",
+             fontsize=TICK_FS, color="#BBBBBB", family="monospace")
+
+    out = FIG_DIR / "same_kernel_comparison.png"
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print("Saved figures/same_kernel_comparison.png")
+
+    # --- 5. Tables ---
+    def fmt_table(headers: list[str], rows: list[list[str]], n_left: int = 2) -> tuple[str, str]:
+        widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+        just   = lambda cells: "  ".join(c.ljust(w) if i < n_left else c.rjust(w)
+                                         for i, (c, w) in enumerate(zip(cells, widths)))
+        sep    = "=" * len(just(headers))
+        text   = "\n".join([sep, just(headers), sep, *(just(r) for r in rows), sep])
+        md     = "\n".join(["| " + " | ".join(headers) + " |",
+                            "|" + "|".join(["---"] * n_left + ["---:"] * (len(headers) - n_left)) + "|",
+                            *("| " + " | ".join(r) + " |" for r in rows)])
+        return text, md
+
+    def summary_rows(data) -> list[list[str]]:
+        rows = []
+        for cond in conds:
+            for mode in SAME_KERNEL_MODES:
+                s, p, p9 = (vals(data, mode, cond, m) for m in ("std", "p99", "p999"))
+                idle_med = float(np.median(vals(data, mode, "idle", "std")))
+                delta = ("—" if cond == "idle"
+                         else f"{(np.median(s) - idle_med) / idle_med * 100:+.1f}%")
+                rows.append([cond_names[cond], mode, str(len(s)),
+                             f"{np.median(s):.2f}", f"{min(s):.2f}–{max(s):.2f}",
+                             f"{np.median(p):.1f}", f"{min(p):.1f}–{max(p):.1f}",
+                             f"{np.median(p9):.1f}", delta])
+        return rows
+
+    summary_headers = ["Condition", "Mode", "n", "Median std", "Std range",
+                       "Median p99", "p99 range", "Median p99.9", "Δ median std vs idle"]
+
+    def separation(data, cond: str, metric: str) -> str:
+        f, n = vals(data, "full", cond, metric), vals(data, "none", cond, metric)
+        if max(f) < min(n):
+            return "full entirely below none"
+        if max(n) < min(f):
+            return "none entirely below full"
+        return "ranges overlap"
+
+    sep_rows = [[cond_names[c], m, separation(runs, c, mk), separation(trimmed, c, mk)]
+                for c in conds
+                for m, mk in (("std", "std"), ("p99", "p99"), ("p99.9", "p999"))]
+
+    # Reject counts: accepted runs in data/raw plus rejected attempts in data/rejected.
+    rej_pattern = re.compile(r"^2khz_(full|none)_(idle|cpu|mem|combined)\d+_attempt\d+$")
+    rejects: dict[tuple[str, str], int] = defaultdict(int)
+    if REJECTED_DIR.exists():
+        for p in REJECTED_DIR.glob("*.csv"):
+            m = rej_pattern.match(p.stem)
+            if m:
+                rejects[(m.group(1), m.group(2))] += 1
+    rej_rows: list[list[str]] = []
+    stress_totals = {mode: [0, 0] for mode in SAME_KERNEL_MODES}   # [rejects, accepted]
+    for mode in SAME_KERNEL_MODES:
+        for cond, accepted in SAME_KERNEL_RUNS.items():
+            r = rejects[(mode, cond)]
+            attempts = accepted + r
+            rej_rows.append([mode, cond_names[cond], str(attempts), str(r),
+                             f"{r / attempts * 100:.0f}%"])
+            if cond != "idle":
+                stress_totals[mode][0] += r
+                stress_totals[mode][1] += accepted
+    _, fisher_p = fisher_exact([stress_totals["full"], stress_totals["none"]])
+    fr, fa = stress_totals["full"]
+    nr, na = stress_totals["none"]
+    fisher_line = (f"Fisher exact test, stress rejects full vs none "
+                   f"({fr}/{fr + fa} vs {nr}/{nr + na}): two-sided p = {fisher_p:.4f}")
+
+    t_a = fmt_table(summary_headers, summary_rows(runs))
+    t_b = fmt_table(["Condition", "Metric", "Full capture", f"Warmup-trimmed"], sep_rows)
+    t_c = fmt_table(summary_headers, summary_rows(trimmed))
+    t_d = fmt_table(["Mode", "Condition", "Attempts", "Rejects", "Reject rate"], rej_rows)
+
+    titles = [
+        "a) Per-condition summary (per-run values; full 30 s captures)",
+        "b) Separation check: run values of full vs none",
+        f"c) Per-condition summary, warmup-trimmed (first {WARMUP_INTERVALS:,} intervals dropped)",
+        "d) Reject counts (SYN_DROPPED captures in data/rejected/)",
+    ]
+    print(f"\nSame-kernel comparison, {kernel_release}, 2 kHz")
+    for title, (text, _) in zip(titles, (t_a, t_b, t_c, t_d)):
+        print(f"\n{title}\n{text}")
+    print(fisher_line + "\n")
+
+    md = [f"# Same-Kernel Comparison: Preemption Mode Only, 2 kHz", "",
+          f"Kernel `{kernel_release}` booted with dynamic preemption `full` and `none`. "
+          "Every value is computed per run; medians and ranges are across runs. "
+          "Nothing is pooled across runs.", ""]
+    for title, (_, table) in zip(titles, (t_a, t_b, t_c, t_d)):
+        md += [f"## {title}", "", table, ""]
+    md += [fisher_line, "", "Stress parameters:", ""]
+    md += [f"- {cond_names[c]}: `{cmd}`" for c, cmd in STRESS_PARAMS.items()]
+    (FIG_DIR / "same_kernel_stats.md").write_text("\n".join(md) + "\n")
+    print("Saved figures/same_kernel_stats.md")
+
+
+# ---------------------------------------------------------------------------
 # Terminal summary
 # ---------------------------------------------------------------------------
 def print_summary() -> None:
@@ -758,5 +994,6 @@ if __name__ == "__main__":
     plot_timeseries()
     plot_stats_table()
     plot_stress_comparison()
+    plot_same_kernel_comparison()
     print_summary()
     print("Done. Figures written to figures/")
